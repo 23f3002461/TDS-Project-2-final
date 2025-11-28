@@ -1,5 +1,5 @@
 # requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn", "python-dotenv", "httpx"]
+# dependencies = ["fastapi", "uvicorn", "python-dotenv", "httpx", "beautifulsoup4"]
 
 import os
 import re
@@ -80,21 +80,75 @@ async def call_aipipe(prompt: str, retries: int = 2, backoff: float = 1.0) -> Di
 
 async def exec_generated_code(code: str, timeout: float = 100.0):
     """
-    Execute generated code in-process. The generated script SHOULD define
-    an async function: async def main(): ... which will be awaited.
-    This avoids subprocess and heavy dependencies.
+    Execute generated code in-process with pre-imported safe modules.
+    The generated script SHOULD define an async function: async def main(): ... 
+    which will be awaited.
     """
-    # prepare isolated namespaces (limited)
-    global_ns: Dict[str, Any] = {"__name__": "__generated__"}
+    # Import modules that the generated code will need
+    import httpx as httpx_module
+    import asyncio as asyncio_module
+    import base64 as base64_module
+    import json as json_module
+    import re as re_module
+    from bs4 import BeautifulSoup
+    
+    # Whitelist of safe builtins
+    safe_builtins = {
+        'print': print,
+        'len': len,
+        'str': str,
+        'int': int,
+        'float': float,
+        'bool': bool,
+        'list': list,
+        'dict': dict,
+        'tuple': tuple,
+        'set': set,
+        'range': range,
+        'enumerate': enumerate,
+        'zip': zip,
+        'max': max,
+        'min': min,
+        'sum': sum,
+        'abs': abs,
+        'round': round,
+        'isinstance': isinstance,
+        'hasattr': hasattr,
+        'getattr': getattr,
+        'Exception': Exception,
+        'ValueError': ValueError,
+        'KeyError': KeyError,
+        'TypeError': TypeError,
+        'AttributeError': AttributeError,
+        'IndexError': IndexError,
+        'RuntimeError': RuntimeError,
+    }
+    
+    # Prepare namespace WITH pre-imported modules
+    global_ns: Dict[str, Any] = {
+        "__name__": "__generated__",
+        "__builtins__": safe_builtins,
+        # Pre-import required modules so generated code can use them
+        "httpx": httpx_module,
+        "asyncio": asyncio_module,
+        "base64": base64_module,
+        "BeautifulSoup": BeautifulSoup,
+        "json": json_module,
+        "re": re_module,
+    }
     local_ns: Dict[str, Any] = {}
 
     try:
         # compile first to raise syntax errors early
         compiled = compile(code, "<generated>", "exec")
         exec(compiled, global_ns, local_ns)
-    except Exception:
+    except Exception as e:
         print("EXECUTION - compile/exec error:\n", traceback.format_exc())
-        return {"status": "error", "reason": "compile_error"}
+        return {
+            "status": "error", 
+            "reason": "compile_error",
+            "error_detail": str(e)
+        }
 
     # run async main() if present
     main = local_ns.get("main") or global_ns.get("main")
@@ -105,9 +159,13 @@ async def exec_generated_code(code: str, timeout: float = 100.0):
         except asyncio.TimeoutError:
             print("EXECUTION - generated script timed out")
             return {"status": "error", "reason": "timeout"}
-        except Exception:
+        except Exception as e:
             print("EXECUTION - runtime error:\n", traceback.format_exc())
-            return {"status": "error", "reason": "runtime_error"}
+            return {
+                "status": "error", 
+                "reason": "runtime_error",
+                "error_detail": str(e)
+            }
     else:
         # no async main - attempt to call sync main() if exists
         if callable(main):
@@ -115,9 +173,13 @@ async def exec_generated_code(code: str, timeout: float = 100.0):
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, main)
                 return {"status": "ok", "result": result}
-            except Exception:
+            except Exception as e:
                 print("EXECUTION - sync main() error:\n", traceback.format_exc())
-                return {"status": "error", "reason": "sync_main_error"}
+                return {
+                    "status": "error", 
+                    "reason": "sync_main_error",
+                    "error_detail": str(e)
+                }
         else:
             print("EXECUTION - no main() found in generated script")
             return {"status": "error", "reason": "no_main"}
@@ -137,8 +199,13 @@ async def process_request(data: Dict[str, Any]):
         email = data.get("email")
         secret = data.get("secret")
 
+        # Validate URL format
+        if not start_url or not start_url.startswith(("http://", "https://")):
+            print("ERROR: Invalid URL format")
+            return
+
         # -------------------------------------------------------------
-        # STRICT, SAFE PROMPT (F-string safe)
+        # STRICT, SAFE PROMPT
         # -------------------------------------------------------------
         prompt = f"""
 You are an autonomous quiz-solving agent.
@@ -146,16 +213,13 @@ You MUST output ONLY valid Python code. No markdown, no backticks, no explanatio
 
 CRITICAL RULES — FOLLOW EXACTLY:
 
-1. Your script MUST begin with EXACTLY these imports at the very top:
-
-import httpx
-import asyncio
-import base64
-from bs4 import BeautifulSoup
-import json
-import re
-
-If these imports are missing, reordered, or modified → INVALID.
+1. DO NOT include any import statements. The following modules are already available:
+   - httpx
+   - asyncio
+   - base64
+   - BeautifulSoup (from bs4)
+   - json
+   - re
 
 2. You MUST define:
 
@@ -183,6 +247,7 @@ async def main():
    - Return the final JSON response from main()
 
 4. STRICTLY FORBIDDEN:
+   - ANY import statements (modules are pre-imported)
    - asyncio.run(...)
    - if __name__ == "__main__"
    - subprocess / os.system
@@ -191,6 +256,8 @@ async def main():
 
 5. DO NOT call main() yourself.
    The platform will execute main().
+
+6. Use httpx.AsyncClient() for HTTP requests.
 
 Output ONLY the Python script now:
 """
@@ -216,24 +283,17 @@ Output ONLY the Python script now:
         print("Generated script length:", len(script_code))
 
         # -------------------------------------------------------------
-        # FAILSAFE #1 — REMOVE ALL LLM IMPORTS + FORCE OURS
+        # FAILSAFE — REMOVE ALL IMPORTS (modules are pre-injected)
         # -------------------------------------------------------------
-        required_imports = (
-            "import httpx\n"
-            "import asyncio\n"
-            "import base64\n"
-            "from bs4 import BeautifulSoup\n"
-            "import json\n"
-            "import re\n"
-        )
-
         cleaned_lines = []
         for line in script_code.splitlines():
+            # Remove ALL import statements since modules are pre-provided
             if re.match(r"^\s*(import|from)\s+", line):
+                print(f"Removed import line: {line.strip()}")
                 continue
             cleaned_lines.append(line)
 
-        script_code = required_imports + "\n" + "\n".join(cleaned_lines)
+        script_code = "\n".join(cleaned_lines)
 
         # -------------------------------------------------------------
         # FAILSAFE #2 — Remove forbidden patterns
@@ -241,7 +301,7 @@ Output ONLY the Python script now:
         forbidden_patterns = [
             "asyncio.run(",
             "if __name__ == '__main__'",
-            "if __name__ == \"__main__\"",
+            'if __name__ == "__main__"',
         ]
 
         for pat in forbidden_patterns:
@@ -251,10 +311,19 @@ Output ONLY the Python script now:
 
         # Remove accidental direct calls to main()
         script_code = re.sub(
-            r"(?<!def )main\(\)",
+            r"(?<!def )(?<!async def )main\(\)",
             "# REMOVED_BY_SANITIZER main()",
             script_code
         )
+
+        # -------------------------------------------------------------
+        # DEBUG: Print sanitized script
+        # -------------------------------------------------------------
+        print("=" * 60)
+        print("SANITIZED SCRIPT:")
+        print("=" * 60)
+        print(script_code)
+        print("=" * 60)
 
         # -------------------------------------------------------------
         # EXECUTE SCRIPT IN-PROCESS
@@ -265,8 +334,6 @@ Output ONLY the Python script now:
 
     except Exception:
         print("process_request unexpected error:\n", traceback.format_exc())
-
-
 
 
 # ----- API endpoints -----
