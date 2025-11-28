@@ -1,5 +1,3 @@
-# TDS-Project-2-final
-minimal app for LLM deployment project
 # IITM LLM Quiz Solver – Safe Mode Architecture
 
 This repository contains a fully working **FastAPI-based quiz solver** designed for the IITM LLM Analysis Project.  
@@ -36,16 +34,14 @@ Only the server fetches pages, parses HTML, computes answers and submits.
 The LLM is used only to compute the final answer for each question.
 
 🚀 Live Endpoint
-
 Your public POST endpoint (for IITM):
 
+bash
+Copy code
 https://web-production-b0da9.up.railway.app/receive_request
-
-
 This is the URL you must submit in the IITM Google Form.
 
 📦 Features
-
 Fully asynchronous httpx.AsyncClient
 
 Safe HTML parsing using BeautifulSoup
@@ -63,23 +59,25 @@ Clean Safe Mode (no subprocess, no dynamic code execution)
 Works on Railway / Render / any cloud
 
 📁 Project Structure
+graphql
+Copy code
 .
 ├── receive_request.py    # Main FastAPI server (safe-mode solver)
 ├── requirements.txt      # All dependencies
 ├── README.md             # Documentation
 └── LICENSE               # MIT License
-
 🔧 Environment Variables
-
 Create .env:
 
+ini
+Copy code
 SECRET_KEY=your_secret_here
 AIPIPE_TOKEN=your_openrouter_aipipe_token
-
-
 Both must be added to Railway → Variables.
 
 🧪 Testing With CURL
+makefile
+Copy code
 curl -X POST "https://web-production-b0da9.up.railway.app/receive_request" \
 -H "Content-Type: application/json" \
 -d '{
@@ -87,35 +85,53 @@ curl -X POST "https://web-production-b0da9.up.railway.app/receive_request" \
   "secret": "your_secret",
   "url": "https://tds-llm-analysis.s-anand.net/demo"
 }'
-
-
 Expected response:
-{ "message": "Request accepted" }
 
+json
+Copy code
+{ "message": "Request accepted" }
 📜 How It Works Internally
 /receive_request validates the secret.
+
 Background task process_request() starts execution.
+
 Solver fetches the URL.
+
 Extracts Base64 → decodes → parses question.
+
 Sends question to AIPipe using a strict JSON-only prompt.
+
 Receives answer.
+
 Submits JSON to the quiz’s submit endpoint.
+
 If response contains "url", it follows the next quiz.
+
 Stops when submission endpoint returns non-JSON.
+
 All steps logged with helpful prints for debugging.
 
 ⚙️ Deployment Instructions (Railway)
 Create a Python service.
+
 Upload these files.
+
 Add environment variables:
+
 SECRET_KEY
+
 AIPIPE_TOKEN
 
 Set Start Command:
+
+nginx
+Copy code
 uvicorn receive_request:app --host 0.0.0.0 --port $PORT
 Deploy.
 
 📦 requirements.txt
+nginx
+Copy code
 fastapi
 uvicorn
 python-dotenv
