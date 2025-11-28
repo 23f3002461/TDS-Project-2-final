@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
-AIPIPE_URL = "https://aipipe.org/v1/chat/completions"
+AIPIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 app = FastAPI()
@@ -73,6 +73,7 @@ Return ONLY the Python code now:
     )
 
     result = llm_response.json()
+    print("AIPipe Raw Response:", result)
     script_code = result["choices"][0]["message"]["content"]
 
     # save script
