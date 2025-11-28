@@ -116,24 +116,31 @@ def extract_question_text(decoded_html: str) -> str:
 
 
 def find_submit_url(html: str, base_url: str) -> Optional[str]:
-    # absolute https://.../submit
-    m = re.search(r"https?://[^\s\"']+/submit[^\s\"']*", html)
+    """
+    Robust extraction of the REAL submit URL.
+    It ONLY returns URLs ending with '/submit' and ignores broken HTML.
+    """
+
+    # 1. Absolute correct submit URL
+    m = re.search(r"https?://[^\s\"'>]+/submit\b", html)
     if m:
         return m.group(0)
 
-    # JSON-style "url":"..."
-    m2 = re.search(r'"url"\s*:\s*"([^"]+)"', html)
+    # 2. JSON-like "url": "/submit"
+    m2 = re.search(r'"url"\s*:\s*"(/submit[^"]*)"', html)
     if m2:
         from urllib.parse import urljoin
         return urljoin(base_url, m2.group(1))
 
-    # fallback "/submit..."
-    m3 = re.search(r"/submit[^\s\"']*", html)
+    # 3. ANY text containing /submit but NOT inside HTML tags
+    # Prevent matching things like "<span class...."
+    m3 = re.search(r"(?<!<)[/][s]ubmit[^\s\"'>]*", html, re.IGNORECASE)
     if m3:
         from urllib.parse import urljoin
         return urljoin(base_url, m3.group(0))
 
     return None
+
 
 
 # ===== CORE QUIZ PROCESSOR =====
