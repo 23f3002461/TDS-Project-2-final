@@ -208,59 +208,86 @@ async def process_request(data: Dict[str, Any]):
         # STRICT, SAFE PROMPT
         # -------------------------------------------------------------
         prompt = f"""
-You are an autonomous quiz-solving agent.
-You MUST output ONLY valid Python code. No markdown, no backticks, no explanation.
+You MUST output ONLY valid Python code with no markdown or explanations.
 
-CRITICAL RULES — FOLLOW EXACTLY:
+You MUST follow this exact template.
+Do NOT change function names.
+Do NOT change import order.
+Do NOT add or remove functions.
+Do NOT reorder code.
+Do NOT add global code outside main().
 
-1. DO NOT include any import statements. The following modules are already available:
-   - httpx
-   - asyncio
-   - base64
-   - BeautifulSoup (from bs4)
-   - json
-   - re
+------------------------------------------------------------
+import httpx
+import asyncio
+import base64
+from bs4 import BeautifulSoup
+import json
+import re
 
-2. You MUST define:
+async def fetch_page(client, url):
+    resp = await client.get(url)
+    html = resp.text
+    m = re.search(r'atob\\("([^"]+)"\\)', html)
+    if not m:
+        return None, html
+    decoded = base64.b64decode(m.group(1)).decode("utf-8")
+    return decoded, html
+
+async def extract_question(decoded):
+    soup = BeautifulSoup(decoded, "html.parser")
+    div = soup.find("div", {"id": "result"}) or soup.find("div", class_="question")
+    return div.get_text(strip=True) if div else ""
+
+async def extract_submit_url(decoded_or_raw):
+    m = re.search(r'"url":"([^"]+)"', decoded_or_raw)
+    return m.group(1) if m else None
+
+async def compute_answer(question):
+    # You MUST compute the REAL answer.
+    # Parse numbers, tables, equations, etc.
+    return ...  # fill in exact logic
+
+async def submit_answer(client, submit_url, email, secret, url, answer):
+    payload = {
+        "email": email,
+        "secret": secret,
+        "url": url,
+        "answer": answer
+    }
+    resp = await client.post(submit_url, json=payload)
+    return resp.json()
 
 async def main():
+    email = "{email}"
+    secret = "{secret}"
+    url = "{start_url}"
 
-3. Inside main(), you MUST:
-   - Fetch the quiz page at: {start_url}
-   - Extract base64-encoded HTML inside <script> tags containing atob("...")
-   - Decode using base64.b64decode(...)
-   - Parse decoded HTML using BeautifulSoup
-   - Extract quiz question text
-   - Compute the required answer
-   - Extract submit URL using regex
-   - POST:
+    async with httpx.AsyncClient() as client:
+        while True:
+            decoded, raw = await fetch_page(client, url)
+            html_for_submit = decoded if decoded else raw
 
-     {{
-       "email": "{email}",
-       "secret": "{secret}",
-       "url": "<CURRENT_URL>",
-       "answer": ANSWER
-     }}
+            question = await extract_question(decoded or raw)
+            submit_url = await extract_submit_url(html_for_submit)
+            answer = await compute_answer(question)
 
-   - If the response contains "url", recursively fetch the next quiz
-   - Stop when no new URL exists
-   - Return the final JSON response from main()
+            result = await submit_answer(client, submit_url, email, secret, url, answer)
 
-4. STRICTLY FORBIDDEN:
-   - ANY import statements (modules are pre-imported)
-   - asyncio.run(...)
-   - if __name__ == "__main__"
-   - subprocess / os.system
-   - playwright / selenium
-   - Any outside LLM calls
+            if "url" not in result:
+                return result
 
-5. DO NOT call main() yourself.
-   The platform will execute main().
+            url = result["url"]
+------------------------------------------------------------
 
-6. Use httpx.AsyncClient() for HTTP requests.
-
-Output ONLY the Python script now:
+RULES:
+- You MUST output ONLY the complete Python script.
+- You MUST NOT write markdown, backticks, or explanations.
+- You MUST NOT call main() yourself.
+- You MUST NOT use asyncio.run().
+- You MUST NOT use external tools like playwright.
 """
+
 
         # -------------------------------------------------------------
         # CALL LLM
