@@ -137,8 +137,14 @@ async def process_request(data: Dict[str, Any]):
         secret = data.get("secret")
 
         prompt = f"""
-You are an autonomous quiz-solving agent. Output ONLY a complete Python script (no explanation, no markdown).
-The script MUST start with these imports exactly:
+You are an autonomous quiz-solving agent. 
+You MUST output ONLY a valid Python script. 
+NO markdown. NO explanations. NO comments.
+
+CRITICAL RULES — READ CAREFULLY:
+
+1. The script MUST start with EXACTLY these imports at the top:
+
 import httpx
 import asyncio
 import base64
@@ -146,18 +152,37 @@ from bs4 import BeautifulSoup
 import json
 import re
 
-Constraints:
-- Use only Python standard library and httpx (async).
-- The script MUST define: `async def main():` which performs the complete solve & returns the final submission result (a JSON-serializable object or value).
-- The script MUST fetch the starting URL: {start_url}, extract the quiz question (handle base64-encoded HTML embedded in <script> tags), compute the answer, find the submit URL in the page, POST the JSON:
-  {{ "email": "{email}", "secret": "{secret}", "url": "<current_quiz_url>", "answer": <answer> }}
-- If the server returns a new 'url', the script MUST follow it and repeat until no new url is provided.
-- The script MUST use httpx.AsyncClient() and async/await.
-- No playwright, no selenium, no external binaries. Detect and decode base64 fragments and HTML in scripts.
-- Keep the script concise and deterministic; avoid long commentary and do not call external LLMs.
-- Print minimal progress and return the final server response (the last POST response) from main().
+2. If your script does NOT begin with these exact imports, 
+   the result is INVALID and must NOT be returned.
 
-Start script now.
+3. Do NOT add or remove imports. Do NOT rearrange them.
+
+4. The script MUST define:
+
+async def main():
+
+5. Inside main(), you MUST:
+   - Fetch the quiz URL (async httpx)
+   - Detect <script> with base64 "atob(" encoded HTML
+   - Decode using base64.b64decode
+   - Extract quiz question text
+   - Compute the answer
+   - Extract submit URL using regex
+   - POST:
+     {
+       "email": "<EMAIL>",
+       "secret": "<SECRET>",
+       "url": "<CURRENT_URL>",
+       "answer": <answer>
+     }
+   - If response has "url", recursively continue
+   - Return final response object
+
+6. NO playwright. NO selenium. NO subprocess. NO external libraries.
+
+7. The script MUST run using only standard library + httpx + bs4.
+
+8. NEVER call any LLM inside the generated script.
 """
 
         # call AIPipe
