@@ -208,13 +208,84 @@ async def process_request(data: Dict[str, Any]):
         # STRICT, SAFE PROMPT
         # -------------------------------------------------------------
         prompt = f"""
-You have been given a task {data} which have a url {data.get("url")}, Generate a standalone
-python script that uses httpx to visit this URL, read the quiz question on the page,
-generate an appropriate answer using an LLM API (like AIPIPE) with the following token:
-{AIPIPE_TOKEN}, and then POST the answer back to the submission endpoint found on that
-page. Make sure to include all necessary headers and handle any required JSON formatting
-for both the LLM request and the submission. The script should be fully functional and
-ready to run.
+You MUST output ONLY valid Python code with no markdown or explanations.
+
+You MUST follow this exact template.
+Do NOT change function names.
+Do NOT change import order.
+Do NOT add or remove functions.
+Do NOT reorder code.
+Do NOT add global code outside main().
+
+------------------------------------------------------------
+import httpx
+import asyncio
+import base64
+from bs4 import BeautifulSoup
+import json
+import re
+
+async def fetch_page(client, url):
+    resp = await client.get(url)
+    html = resp.text
+    m = re.search(r'atob\\("([^"]+)"\\)', html)
+    if not m:
+        return None, html
+    decoded = base64.b64decode(m.group(1)).decode("utf-8")
+    return decoded, html
+
+async def extract_question(decoded):
+    soup = BeautifulSoup(decoded, "html.parser")
+    div = soup.find("div", {"id": "result"}) or soup.find("div", class_="question")
+    return div.get_text(strip=True) if div else ""
+
+async def extract_submit_url(decoded_or_raw):
+    m = re.search(r'"url":"([^"]+)"', decoded_or_raw)
+    return m.group(1) if m else None
+
+async def compute_answer(question):
+    # You MUST compute the REAL answer.
+    # Parse numbers, tables, equations, etc.
+    return ...  # fill in exact logic
+
+async def submit_answer(client, submit_url, email, secret, url, answer):
+    payload = {
+        "email": email,
+        "secret": secret,
+        "url": url,
+        "answer": answer
+    }
+    resp = await client.post(submit_url, json=payload)
+    return resp.json()
+
+async def main():
+    email = "{email}"
+    secret = "{secret}"
+    url = "{start_url}"
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            decoded, raw = await fetch_page(client, url)
+            html_for_submit = decoded if decoded else raw
+
+            question = await extract_question(decoded or raw)
+            submit_url = await extract_submit_url(html_for_submit)
+            answer = await compute_answer(question)
+
+            result = await submit_answer(client, submit_url, email, secret, url, answer)
+
+            if "url" not in result:
+                return result
+
+            url = result["url"]
+------------------------------------------------------------
+
+RULES:
+- You MUST output ONLY the complete Python script.
+- You MUST NOT write markdown, backticks, or explanations.
+- You MUST NOT call main() yourself.
+- You MUST NOT use asyncio.run().
+- You MUST NOT use external tools like playwright.
 
 """
 
