@@ -90,48 +90,29 @@ curl -X POST "https://web-production-b0da9.up.railway.app/receive_request" \
 
 
 Expected response:
-
 { "message": "Request accepted" }
 
 📜 How It Works Internally
-
 /receive_request validates the secret.
-
 Background task process_request() starts execution.
-
 Solver fetches the URL.
-
 Extracts Base64 → decodes → parses question.
-
 Sends question to AIPipe using a strict JSON-only prompt.
-
 Receives answer.
-
 Submits JSON to the quiz’s submit endpoint.
-
 If response contains "url", it follows the next quiz.
-
 Stops when submission endpoint returns non-JSON.
-
 All steps logged with helpful prints for debugging.
 
 ⚙️ Deployment Instructions (Railway)
-
 Create a Python service.
-
 Upload these files.
-
 Add environment variables:
-
 SECRET_KEY
-
 AIPIPE_TOKEN
 
 Set Start Command:
-
 uvicorn receive_request:app --host 0.0.0.0 --port $PORT
-
-
 Deploy.
 
 📦 requirements.txt
