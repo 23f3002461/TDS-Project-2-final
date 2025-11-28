@@ -270,11 +270,11 @@ async def process_request(data: Dict[str, Any]):
 
                 # 5) prepare payload and submit
                 payload = {
-                    "email": email,
-                    "secret": secret,
-                    "url": url,
-                    "answer": answer,
-                }
+                        "email": email,
+                        "secret": secret,
+                        "url": url,
+                        "answer": answer,
+                    }
 
                 try:
                     post_resp = await client.post(submit_url, json=payload, timeout=60.0)
@@ -282,15 +282,18 @@ async def process_request(data: Dict[str, Any]):
                     print("POST to submit_url failed:", submit_url, repr(e))
                     break
 
-                # parse response
+                # Try parsing JSON. If not JSON → assume quiz complete.
                 try:
                     post_json = post_resp.json()
                 except Exception:
-                    print("Submit response not JSON:", post_resp.text[:400])
+                    text = (post_resp.text or "").strip()
+                    print("Submit response was not JSON; treating as final:", text[:200])
+                    last_result = {"final": True, "raw_response": text}
                     break
 
                 print("Submit response:", post_json)
                 last_result = post_json
+
 
                 # If there's a next url, follow it; else finish
                 next_url = None
