@@ -138,15 +138,15 @@ async def process_request(data: Dict[str, Any]):
         secret = data.get("secret")
 
         # -------------------------------------------------------------
-        # STRICT, SAFE, F-STRING-COMPATIBLE PROMPT
+        # STRICT, SAFE PROMPT (F-string safe)
         # -------------------------------------------------------------
         prompt = f"""
 You are an autonomous quiz-solving agent.
 You MUST output ONLY valid Python code. No markdown, no backticks, no explanation.
 
-CRITICAL RULES (FAIL IF VIOLATED):
+CRITICAL RULES — FOLLOW EXACTLY:
 
-1. Your script MUST begin with EXACTLY these imports:
+1. Your script MUST begin with EXACTLY these imports at the very top:
 
 import httpx
 import asyncio
@@ -155,70 +155,68 @@ from bs4 import BeautifulSoup
 import json
 import re
 
-THESE IMPORTS MUST BE THE FIRST LINES OF THE SCRIPT.
-If any import is missing or reordered, your answer is INVALID.
+If these imports are missing, reordered, or modified → INVALID.
 
 2. You MUST define:
 
 async def main():
 
-3. main() MUST:
+3. Inside main(), you MUST:
    - Fetch the quiz page at: {start_url}
    - Extract base64-encoded HTML inside <script> tags containing atob("...")
-   - Decode with base64.b64decode(...)
-   - Parse decoded HTML with BeautifulSoup
-   - Extract the quiz question text
-   - Compute the answer (number, string, boolean, or dict)
-   - Extract the submit URL via regex
+   - Decode using base64.b64decode(...)
+   - Parse decoded HTML using BeautifulSoup
+   - Extract quiz question text
+   - Compute the required answer
+   - Extract submit URL using regex
    - POST:
 
      {{
        "email": "{email}",
        "secret": "{secret}",
        "url": "<CURRENT_URL>",
-       "answer": ANSWER_VALUE
+       "answer": ANSWER
      }}
 
-   - If the server returns a new "url", recursively follow it.
-   - Stop when no new URL exists.
-   - Return the FINAL submission response from main().
+   - If the response contains "url", recursively fetch the next quiz
+   - Stop when no new URL exists
+   - Return the final JSON response from main()
 
 4. STRICTLY FORBIDDEN:
    - asyncio.run(...)
    - if __name__ == "__main__"
-   - subprocess / os.system / playwright / selenium
-   - Any external LLM calls
+   - subprocess / os.system
+   - playwright / selenium
+   - Any outside LLM calls
 
 5. DO NOT call main() yourself.
-   The platform will call main() automatically.
+   The platform will execute main().
 
-6. Output ONLY Python code. No extra text.
-
-Start writing the script NOW:
+Output ONLY the Python script now:
 """
 
         # -------------------------------------------------------------
-        # CALL AIPipe LLM
+        # CALL LLM
         # -------------------------------------------------------------
         print("Calling AIPipe to generate solver script...")
         resp_json = await call_aipipe(prompt)
-        print("AIPipe response received (raw).")
+        print("AIPipe response received.")
 
-        # Extract LLM code
+        # Extract LLM text
         try:
             raw_content = resp_json["choices"][0]["message"]["content"]
         except Exception:
             try:
                 raw_content = resp_json["choices"][0]["text"]
             except Exception:
-                print("ERROR: Unrecognized AIPipe response:", resp_json)
+                print("ERROR: Unexpected LLM format:", resp_json)
                 return
 
         script_code = strip_markdown_code(raw_content)
         print("Generated script length:", len(script_code))
 
         # -------------------------------------------------------------
-        # FAILSAFE #1 — Auto-inject imports if missing
+        # FAILSAFE #1 — REMOVE ALL LLM IMPORTS + FORCE OURS
         # -------------------------------------------------------------
         required_imports = (
             "import httpx\n"
@@ -229,12 +227,16 @@ Start writing the script NOW:
             "import re\n"
         )
 
-        if not script_code.lstrip().startswith("import httpx"):
-            print("Auto-injecting required imports...")
-            script_code = required_imports + "\n" + script_code
+        cleaned_lines = []
+        for line in script_code.splitlines():
+            if re.match(r"^\s*(import|from)\s+", line):
+                continue
+            cleaned_lines.append(line)
+
+        script_code = required_imports + "\n" + "\n".join(cleaned_lines)
 
         # -------------------------------------------------------------
-        # FAILSAFE #2 — Strip forbidden patterns
+        # FAILSAFE #2 — Remove forbidden patterns
         # -------------------------------------------------------------
         forbidden_patterns = [
             "asyncio.run(",
@@ -244,14 +246,10 @@ Start writing the script NOW:
 
         for pat in forbidden_patterns:
             if pat in script_code:
-                print("Sanitizer: removing forbidden pattern:", pat)
+                print("Sanitizer removed:", pat)
                 script_code = script_code.replace(pat, f"# REMOVED_BY_SANITIZER {pat}")
 
-        # -------------------------------------------------------------
-        # FAILSAFE #3 — Prevent "main()" from being called inline
-        # -------------------------------------------------------------
-        # Remove patterns like: main()
-        # But keep "async def main():"
+        # Remove accidental direct calls to main()
         script_code = re.sub(
             r"(?<!def )main\(\)",
             "# REMOVED_BY_SANITIZER main()",
@@ -259,15 +257,15 @@ Start writing the script NOW:
         )
 
         # -------------------------------------------------------------
-        # EXECUTE CLEAN SCRIPT
+        # EXECUTE SCRIPT IN-PROCESS
         # -------------------------------------------------------------
-        print("Executing generated script in-process (awaiting main()) ...")
+        print("Executing script in-process (awaiting main())...")
         exec_result = await exec_generated_code(script_code, timeout=120.0)
-
         print("Execution result:", exec_result)
 
     except Exception:
         print("process_request unexpected error:\n", traceback.format_exc())
+
 
 
 
