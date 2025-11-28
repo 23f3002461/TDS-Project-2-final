@@ -138,6 +138,14 @@ async def process_request(data: Dict[str, Any]):
 
         prompt = f"""
 You are an autonomous quiz-solving agent. Output ONLY a complete Python script (no explanation, no markdown).
+The script MUST start with these imports exactly:
+import httpx
+import asyncio
+import base64
+from bs4 import BeautifulSoup
+import json
+import re
+
 Constraints:
 - Use only Python standard library and httpx (async).
 - The script MUST define: `async def main():` which performs the complete solve & returns the final submission result (a JSON-serializable object or value).
