@@ -146,21 +146,42 @@ def decode_base64_to_html(b64: str) -> Optional[str]:
     except Exception:
         return None
 
+def find_submit_url_in_html(html: str, base_url: str) -> Optional[str]:
+    """
+    Extract submit URL from HTML. Supports both absolute and relative URLs.
+    """
 
-def find_submit_url_in_html(html: str) -> Optional[str]:
-    """
-    Extract submit URL from HTML. The pages include submit URL in the decoded HTML as an absolute URL.
-    We try a couple of patterns.
-    """
-    # look for "https://.../submit" or any https://... string in JSON-like content
+    # 1. Absolute URL
     m = re.search(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", html)
     if m:
         return m.group(0)
-    # fallback: look for "url":"https://..."
+
+    # 2. JSON-like "url":"...something..."
     m2 = re.search(r'"url"\s*:\s*"([^"]+)"', html)
     if m2:
-        return m2.group(1)
+        url_candidate = m2.group(1).strip()
+
+        # Already absolute?
+        if url_candidate.startswith("http://") or url_candidate.startswith("https://"):
+            return url_candidate
+
+        # Starts with "/", relative path
+        if url_candidate.startswith("/"):
+            from urllib.parse import urljoin
+            return urljoin(base_url, url_candidate)
+
+        # Bare relative path → also join
+        from urllib.parse import urljoin
+        return urljoin(base_url, "/" + url_candidate)
+
+    # 3. Hard fallback: search for "/submit"
+    m3 = re.search(r"/submit[^\s'\"<>]*", html)
+    if m3:
+        from urllib.parse import urljoin
+        return urljoin(base_url, m3.group(0))
+
     return None
+
 
 
 def extract_question_text(decoded_html: str) -> str:
@@ -235,7 +256,7 @@ async def process_request(data: Dict[str, Any]):
                     break
 
                 # 3) find submit URL inside decoded content or original html
-                submit_url = find_submit_url_in_html(page_to_parse)
+                submit_url = find_submit_url_in_html(page_to_parse, url)
                 if not submit_url:
                     print("No submit URL found on page; aborting. Page snippet:", page_to_parse[:400])
                     break
