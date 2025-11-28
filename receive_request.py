@@ -5,363 +5,293 @@ import os
 import re
 import asyncio
 import traceback
+import json
 from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
+import base64
 
 load_dotenv()
 
 # ----- Config -----
 SECRET_KEY = os.getenv("SECRET_KEY")
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+# AIPipe OpenRouter endpoint (confirmed)
 AIPIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
 LLM_MODEL = "openai/gpt-4.1-nano"
 
 if not SECRET_KEY or not AIPIPE_TOKEN:
-    # do not crash on startup; print a warning for logs
     print("WARNING: SECRET_KEY or AIPIPE_TOKEN not set in environment")
 
 # ----- App & global async client -----
 app = FastAPI()
-http_client = httpx.AsyncClient(timeout=60.0)  # global async client
+http_client = httpx.AsyncClient(timeout=60.0)
 
 
 # ----- Helpers -----
-def strip_markdown_code(text: str) -> str:
-    """
-    Extract the first fenced code block if present, otherwise return the text.
-    """
-    # find ```...``` blocks
-    m = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
+def safe_json_load(s: str) -> Optional[Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
 
 
-async def call_aipipe(prompt: str, retries: int = 2, backoff: float = 1.0) -> Dict[str, Any]:
+async def call_aipipe_for_answer(question_text: str, retries: int = 2, timeout: float = 30.0) -> Any:
     """
-    Call the AIPipe OpenRouter endpoint (async), with simple retry/backoff.
-    Returns parsed JSON response or raises an exception.
+    Ask AIPipe to compute the answer for the given question_text.
+    Returns the parsed answer (number/string/bool/object) or raises an exception.
+    This function strictly requests a JSON response: {"answer": <value>}
     """
     headers = {
         "Authorization": f"Bearer {AIPIPE_TOKEN}",
         "Content-Type": "application/json",
     }
+
+    # Strict prompt: produce a single JSON object with key "answer"
+    prompt = (
+        "You are an assistant that reads a single quiz question (plaintext) and RETURNS ONLY a JSON object "
+        "with exactly one key 'answer'. Do NOT include any extra text, explanation, or markdown. The value "
+        "should be the computed answer: a number, string, boolean, or JSON object. Example: {\"answer\": 123}\n\n"
+        "QUESTION:\n"
+        f"{question_text}\n\n"
+        "Return only: {\"answer\": ... }\n"
+    )
+
     payload = {
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content": "You generate short, correct Python scripts (no explanation)."},
+            {"role": "system", "content": "You MUST output only valid JSON with a single key named 'answer'."},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 2000,
+        "max_tokens": 300,
         "temperature": 0.0,
     }
 
-    last_exc: Optional[Exception] = None
+    last_exc = None
     for attempt in range(1, retries + 2):
         try:
-            resp = await http_client.post(AIPIPE_URL, headers=headers, json=payload)
-            # raise_for_status will allow us to inspect body on non-2xx
+            resp = await http_client.post(AIPIPE_URL, headers=headers, json=payload, timeout=timeout)
             resp.raise_for_status()
-            return resp.json()
+            j = resp.json()
+            # Expecting choices[0].message.content (OpenRouter/Chat-like)
+            content = None
+            try:
+                content = j["choices"][0]["message"]["content"]
+            except Exception:
+                # fallback older shapes
+                content = j.get("choices", [{}])[0].get("text") if isinstance(j.get("choices"), list) else None
+
+            if content is None:
+                raise ValueError(f"No content in AIPipe response: {j}")
+
+            # Trim whitespace and try to extract a JSON substring
+            text = content.strip()
+
+            # If content contains code fences, strip them
+            # e.g. ```json\n{"answer": 5}\n```
+            m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL | re.IGNORECASE)
+            if m:
+                json_text = m.group(1)
+            else:
+                # Try to find first { ... } block
+                m2 = re.search(r"(\{.*\})", text, re.DOTALL)
+                json_text = m2.group(1) if m2 else text
+
+            parsed = safe_json_load(json_text)
+            if parsed is None or "answer" not in parsed:
+                # If parsing failed, try the whole text as a bare value (e.g., "42" or "true")
+                stripped = text.strip().strip('"').strip("'")
+                # attempt to convert to int/float/bool
+                if re.fullmatch(r"-?\d+", stripped):
+                    return int(stripped)
+                if re.fullmatch(r"-?\d+\.\d+", stripped):
+                    return float(stripped)
+                if stripped.lower() in ("true", "false"):
+                    return stripped.lower() == "true"
+                # Otherwise raise to retry
+                raise ValueError(f"Could not parse JSON answer from LLM output: {text}")
+
+            return parsed["answer"]
+
         except Exception as e:
             last_exc = e
-            # log minimal info and retry
-            print(f"AIPipe call attempt {attempt} failed: {repr(e)}")
+            print(f"AIPipe attempt {attempt} failed: {repr(e)}")
             if attempt <= retries:
-                await asyncio.sleep(backoff * attempt)
+                await asyncio.sleep(1.0 * attempt)
             else:
                 break
+
     raise last_exc
 
 
-async def exec_generated_code(code: str, timeout: float = 100.0):
+def extract_base64_from_html(html: str) -> Optional[str]:
     """
-    Execute generated code in-process with pre-imported safe modules.
-    The generated script SHOULD define an async function: async def main(): ... 
-    which will be awaited.
+    Search for atob("...") pattern and return the base64 string or None.
     """
-    # Import modules that the generated code will need
-    import httpx as httpx_module
-    import asyncio as asyncio_module
-    import base64 as base64_module
-    import json as json_module
-    import re as re_module
-    from bs4 import BeautifulSoup
-    
-    # Whitelist of safe builtins
-    safe_builtins = {
-        'print': print,
-        'len': len,
-        'str': str,
-        'int': int,
-        'float': float,
-        'bool': bool,
-        'list': list,
-        'dict': dict,
-        'tuple': tuple,
-        'set': set,
-        'range': range,
-        'enumerate': enumerate,
-        'zip': zip,
-        'max': max,
-        'min': min,
-        'sum': sum,
-        'abs': abs,
-        'round': round,
-        'isinstance': isinstance,
-        'hasattr': hasattr,
-        'getattr': getattr,
-        'Exception': Exception,
-        'ValueError': ValueError,
-        'KeyError': KeyError,
-        'TypeError': TypeError,
-        'AttributeError': AttributeError,
-        'IndexError': IndexError,
-        'RuntimeError': RuntimeError,
-    }
-    
-    # Prepare namespace WITH pre-imported modules
-    global_ns: Dict[str, Any] = {
-        "__name__": "__generated__",
-        "__builtins__": safe_builtins,
-        # Pre-import required modules so generated code can use them
-        "httpx": httpx_module,
-        "asyncio": asyncio_module,
-        "base64": base64_module,
-        "BeautifulSoup": BeautifulSoup,
-        "json": json_module,
-        "re": re_module,
-    }
-    local_ns: Dict[str, Any] = {}
+    # match atob("...") or atob('...')
+    m = re.search(r'atob\(\s*["\']([^"\']+)["\']\s*\)', html)
+    if m:
+        return m.group(1)
+    return None
 
+
+def decode_base64_to_html(b64: str) -> Optional[str]:
     try:
-        # compile first to raise syntax errors early
-        compiled = compile(code, "<generated>", "exec")
-        exec(compiled, global_ns, local_ns)
-    except Exception as e:
-        print("EXECUTION - compile/exec error:\n", traceback.format_exc())
-        return {
-            "status": "error", 
-            "reason": "compile_error",
-            "error_detail": str(e)
-        }
-
-    # run async main() if present
-    main = local_ns.get("main") or global_ns.get("main")
-    if main and asyncio.iscoroutinefunction(main):
-        try:
-            result = await asyncio.wait_for(main(), timeout=timeout)
-            return {"status": "ok", "result": result}
-        except asyncio.TimeoutError:
-            print("EXECUTION - generated script timed out")
-            return {"status": "error", "reason": "timeout"}
-        except Exception as e:
-            print("EXECUTION - runtime error:\n", traceback.format_exc())
-            return {
-                "status": "error", 
-                "reason": "runtime_error",
-                "error_detail": str(e)
-            }
-    else:
-        # no async main - attempt to call sync main() if exists
-        if callable(main):
-            try:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, main)
-                return {"status": "ok", "result": result}
-            except Exception as e:
-                print("EXECUTION - sync main() error:\n", traceback.format_exc())
-                return {
-                    "status": "error", 
-                    "reason": "sync_main_error",
-                    "error_detail": str(e)
-                }
-        else:
-            print("EXECUTION - no main() found in generated script")
-            return {"status": "error", "reason": "no_main"}
+        b = base64.b64decode(b64)
+        return b.decode("utf-8", errors="replace")
+    except Exception:
+        return None
 
 
-# ----- Core background task -----
+def find_submit_url_in_html(html: str) -> Optional[str]:
+    """
+    Extract submit URL from HTML. The pages include submit URL in the decoded HTML as an absolute URL.
+    We try a couple of patterns.
+    """
+    # look for "https://.../submit" or any https://... string in JSON-like content
+    m = re.search(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", html)
+    if m:
+        return m.group(0)
+    # fallback: look for "url":"https://..."
+    m2 = re.search(r'"url"\s*:\s*"([^"]+)"', html)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def extract_question_text(decoded_html: str) -> str:
+    """
+    Extract human-readable question text from decoded HTML.
+    We look at #result, or first <pre>, or body text.
+    """
+    soup = BeautifulSoup(decoded_html, "html.parser")
+    # Prefer element with id="result"
+    el = soup.find(id="result")
+    if el and el.get_text(strip=True):
+        return el.get_text(separator="\n", strip=True)
+    # fallback to first <pre>
+    pre = soup.find("pre")
+    if pre and pre.get_text(strip=True):
+        return pre.get_text(separator="\n", strip=True)
+    # fallback to body text
+    body = soup.body
+    if body:
+        return body.get_text(separator="\n", strip=True)
+    return decoded_html.strip()
+
+
+# ----- Core background task (SAFE MODE) -----
 async def process_request(data: Dict[str, Any]):
     """
-    Background worker:
-    - Builds strict prompt
-    - Calls AIPipe LLM
-    - Sanitizes + auto-fixes generated code
-    - Executes script in-process by awaiting main()
+    SAFE MODE:
+    - The server performs fetching, decoding, parsing and submission.
+    - The LLM is used ONLY to compute the answer for a single question_text via call_aipipe_for_answer().
+    - This avoids asking the LLM to generate code; it only returns an answer value.
     """
     try:
         start_url = data.get("url")
         email = data.get("email")
         secret = data.get("secret")
 
-        # Validate URL format
         if not start_url or not start_url.startswith(("http://", "https://")):
-            print("ERROR: Invalid URL format")
+            print("Invalid URL:", start_url)
             return
 
-        # -------------------------------------------------------------
-        # STRICT, SAFE PROMPT
-        # -------------------------------------------------------------
-        prompt = f"""
-You MUST output ONLY valid Python code with no markdown or explanations.
+        # set an overall deadline for the whole job (e.g., 150 seconds)
+        overall_deadline = asyncio.get_event_loop().time() + 150
 
-You MUST follow this exact template.
-Do NOT change function names.
-Do NOT change import order.
-Do NOT add or remove functions.
-Do NOT reorder code.
-Do NOT add global code outside main().
+        url = start_url
+        last_result = None
 
-------------------------------------------------------------
-import httpx
-import asyncio
-import base64
-from bs4 import BeautifulSoup
-import json
-import re
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            while True:
+                if asyncio.get_event_loop().time() > overall_deadline:
+                    print("Overall deadline exceeded; aborting.")
+                    break
 
-async def fetch_page(client, url):
-    resp = await client.get(url)
-    html = resp.text
-    m = re.search(r'atob\\("([^"]+)"\\)', html)
-    if not m:
-        return None, html
-    decoded = base64.b64decode(m.group(1)).decode("utf-8")
-    return decoded, html
+                try:
+                    resp = await client.get(url)
+                except Exception as e:
+                    print("HTTP GET failed for", url, repr(e))
+                    break
 
-async def extract_question(decoded):
-    soup = BeautifulSoup(decoded, "html.parser")
-    div = soup.find("div", {"id": "result"}) or soup.find("div", class_="question")
-    return div.get_text(strip=True) if div else ""
+                html = resp.text or ""
+                # 1) try to extract base64 embedded content
+                b64 = extract_base64_from_html(html)
+                decoded_html = None
+                if b64:
+                    decoded_html = decode_base64_to_html(b64)
+                # if no decoded HTML found, treat the original html as the page content
+                page_to_parse = decoded_html if decoded_html else html
 
-async def extract_submit_url(decoded_or_raw):
-    m = re.search(r'"url":"([^"]+)"', decoded_or_raw)
-    return m.group(1) if m else None
+                # 2) extract question text
+                question_text = extract_question_text(page_to_parse)
+                if not question_text:
+                    print("No question text found on page:", url)
+                    break
 
-async def compute_answer(question):
-    # You MUST compute the REAL answer.
-    # Parse numbers, tables, equations, etc.
-    return ...  # fill in exact logic
+                # 3) find submit URL inside decoded content or original html
+                submit_url = find_submit_url_in_html(page_to_parse)
+                if not submit_url:
+                    print("No submit URL found on page; aborting. Page snippet:", page_to_parse[:400])
+                    break
 
-async def submit_answer(client, submit_url, email, secret, url, answer):
-    payload = {
-        "email": email,
-        "secret": secret,
-        "url": url,
-        "answer": answer
-    }
-    resp = await client.post(submit_url, json=payload)
-    return resp.json()
+                # 4) compute answer using LLM (safe single-question call)
+                try:
+                    answer = await call_aipipe_for_answer(question_text)
+                except Exception as e:
+                    print("LLM failed to compute answer:", repr(e))
+                    break
 
-async def main():
-    email = "{email}"
-    secret = "{secret}"
-    url = "{start_url}"
+                # 5) prepare payload and submit
+                payload = {
+                    "email": email,
+                    "secret": secret,
+                    "url": url,
+                    "answer": answer,
+                }
 
-    async with httpx.AsyncClient() as client:
-        while True:
-            decoded, raw = await fetch_page(client, url)
-            html_for_submit = decoded if decoded else raw
+                try:
+                    post_resp = await client.post(submit_url, json=payload, timeout=60.0)
+                except Exception as e:
+                    print("POST to submit_url failed:", submit_url, repr(e))
+                    break
 
-            question = await extract_question(decoded or raw)
-            submit_url = await extract_submit_url(html_for_submit)
-            answer = await compute_answer(question)
+                # parse response
+                try:
+                    post_json = post_resp.json()
+                except Exception:
+                    print("Submit response not JSON:", post_resp.text[:400])
+                    break
 
-            result = await submit_answer(client, submit_url, email, secret, url, answer)
+                print("Submit response:", post_json)
+                last_result = post_json
 
-            if "url" not in result:
-                return result
+                # If there's a next url, follow it; else finish
+                next_url = None
+                if isinstance(post_json, dict) and "url" in post_json and post_json["url"]:
+                    next_url = post_json["url"]
 
-            url = result["url"]
-------------------------------------------------------------
+                if not next_url:
+                    break
 
-RULES:
-- You MUST output ONLY the complete Python script.
-- You MUST NOT write markdown, backticks, or explanations.
-- You MUST NOT call main() yourself.
-- You MUST NOT use asyncio.run().
-- You MUST NOT use external tools like playwright.
+                # protect against infinite loops
+                if next_url == url:
+                    print("Next URL same as current; aborting loop to avoid infinite recursion.")
+                    break
 
-"""
+                url = next_url
 
-
-        # -------------------------------------------------------------
-        # CALL LLM
-        # -------------------------------------------------------------
-        print("Calling AIPipe to generate solver script...")
-        resp_json = await call_aipipe(prompt)
-        print("AIPipe response received.")
-
-        # Extract LLM text
-        try:
-            raw_content = resp_json["choices"][0]["message"]["content"]
-        except Exception:
-            try:
-                raw_content = resp_json["choices"][0]["text"]
-            except Exception:
-                print("ERROR: Unexpected LLM format:", resp_json)
-                return
-
-        script_code = strip_markdown_code(raw_content)
-        print("Generated script length:", len(script_code))
-
-        # -------------------------------------------------------------
-        # FAILSAFE — REMOVE ALL IMPORTS (modules are pre-injected)
-        # -------------------------------------------------------------
-        cleaned_lines = []
-        for line in script_code.splitlines():
-            # Remove ALL import statements since modules are pre-provided
-            if re.match(r"^\s*(import|from)\s+", line):
-                print(f"Removed import line: {line.strip()}")
-                continue
-            cleaned_lines.append(line)
-
-        script_code = "\n".join(cleaned_lines)
-
-        # -------------------------------------------------------------
-        # FAILSAFE #2 — Remove forbidden patterns
-        # -------------------------------------------------------------
-        forbidden_patterns = [
-            "asyncio.run(",
-            "if __name__ == '__main__'",
-            'if __name__ == "__main__"',
-        ]
-
-        for pat in forbidden_patterns:
-            if pat in script_code:
-                print("Sanitizer removed:", pat)
-                script_code = script_code.replace(pat, f"# REMOVED_BY_SANITIZER {pat}")
-
-        # Remove accidental direct calls to main()
-        script_code = re.sub(
-            r"(?<!def )(?<!async def )main\(\)",
-            "# REMOVED_BY_SANITIZER main()",
-            script_code
-        )
-
-        # -------------------------------------------------------------
-        # DEBUG: Print sanitized script
-        # -------------------------------------------------------------
-        print("=" * 60)
-        print("SANITIZED SCRIPT:")
-        print("=" * 60)
-        print(script_code)
-        print("=" * 60)
-
-        # -------------------------------------------------------------
-        # EXECUTE SCRIPT IN-PROCESS
-        # -------------------------------------------------------------
-        print("Executing script in-process (awaiting main())...")
-        exec_result = await exec_generated_code(script_code, timeout=120.0)
-        print("Execution result:", exec_result)
+        print("Background task finished. Last result:", last_result)
+        return
 
     except Exception:
         print("process_request unexpected error:\n", traceback.format_exc())
+        return
 
 
 # ----- API endpoints -----
@@ -408,5 +338,5 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting IITM Quiz Solver (async, in-process execution)")
+    print("Starting IITM Quiz Solver (SAFE MODE TEMPLATE)")
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
