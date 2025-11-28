@@ -252,8 +252,7 @@ async def process_request(data: Dict[str, Any]):
                 # 2) extract question text
                 question_text = extract_question_text(page_to_parse)
                 if not question_text:
-                    print("No question text found on page:", url)
-                    break
+                    print("No question text found — but maybe first page. Continuing.")
 
                 # 3) find submit URL inside decoded content or original html
                 submit_url = find_submit_url_in_html(page_to_parse, url)
