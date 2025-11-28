@@ -7,7 +7,7 @@ import subprocess
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-
+print("Loaded SECRET_KEY:", SECRET_KEY)
 load_dotenv()
 
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
