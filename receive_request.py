@@ -126,24 +126,27 @@ async def exec_generated_code(code: str, timeout: float = 100.0):
 # ----- Core background task -----
 async def process_request(data: Dict[str, Any]):
     """
-    Background worker that:
-    - builds a concise robust prompt instructing the LLM to return ONLY Python code
-    - calls AIPipe to generate the solver script
-    - executes the generated code in-process (expects async main)
+    Background worker:
+    - Builds strict prompt
+    - Calls AIPipe LLM
+    - Sanitizes + auto-fixes generated code
+    - Executes script in-process by awaiting main()
     """
     try:
         start_url = data.get("url")
         email = data.get("email")
         secret = data.get("secret")
 
+        # -------------------------------------------------------------
+        # STRICT, SAFE, F-STRING-COMPATIBLE PROMPT
+        # -------------------------------------------------------------
         prompt = f"""
-You are an autonomous quiz-solving agent. 
-You MUST output ONLY a valid Python script. 
-NO markdown. NO explanations. NO comments.
+You are an autonomous quiz-solving agent.
+You MUST output ONLY valid Python code. No markdown, no backticks, no explanation.
 
-CRITICAL RULES — FOLLOW EXACTLY:
+CRITICAL RULES (FAIL IF VIOLATED):
 
-1. Your script MUST begin with EXACTLY these lines:
+1. Your script MUST begin with EXACTLY these imports:
 
 import httpx
 import asyncio
@@ -152,22 +155,22 @@ from bs4 import BeautifulSoup
 import json
 import re
 
+THESE IMPORTS MUST BE THE FIRST LINES OF THE SCRIPT.
 If any import is missing or reordered, your answer is INVALID.
 
-2. You MUST define the function:
+2. You MUST define:
 
 async def main():
 
 3. main() MUST:
    - Fetch the quiz page at: {start_url}
-   - Extract HTML containing base64-encoded strings inside <script> tags
-   - Detect patterns like atob("....")
-   - Decode using base64.b64decode
-   - Parse decoded HTML using BeautifulSoup
+   - Extract base64-encoded HTML inside <script> tags containing atob("...")
+   - Decode with base64.b64decode(...)
+   - Parse decoded HTML with BeautifulSoup
    - Extract the quiz question text
-   - Compute the answer (e.g., numeric, string, JSON)
-   - Extract submit URL from decoded HTML using regex
-   - POST the answer using:
+   - Compute the answer (number, string, boolean, or dict)
+   - Extract the submit URL via regex
+   - POST:
 
      {{
        "email": "{email}",
@@ -176,61 +179,96 @@ async def main():
        "answer": ANSWER_VALUE
      }}
 
-   - Read the JSON response
-   - If the response contains a "url", recursively fetch the next quiz and continue
-   - Stop when no new "url" is present
-   - Return the FINAL submission result (a Python value)
+   - If the server returns a new "url", recursively follow it.
+   - Stop when no new URL exists.
+   - Return the FINAL submission response from main().
 
-4. DO NOT use:
-   - playwright
-   - selenium
-   - subprocess
-   - any LLM calls
-   - any external libraries except httpx + bs4 + stdlib
+4. STRICTLY FORBIDDEN:
+   - asyncio.run(...)
+   - if __name__ == "__main__"
+   - subprocess / os.system / playwright / selenium
+   - Any external LLM calls
 
-5. The script MUST be concise and strictly valid Python.
+5. DO NOT call main() yourself.
+   The platform will call main() automatically.
 
-Begin your script immediately below.
+6. Output ONLY Python code. No extra text.
+
+Start writing the script NOW:
 """
 
-        # call AIPipe
+        # -------------------------------------------------------------
+        # CALL AIPipe LLM
+        # -------------------------------------------------------------
         print("Calling AIPipe to generate solver script...")
         resp_json = await call_aipipe(prompt)
         print("AIPipe response received (raw).")
 
-        # debug: if choices missing, print entire response and abort
-        if not isinstance(resp_json, dict) or "choices" not in resp_json:
-            print("AIPipe response missing 'choices':", resp_json)
-            return
-
-        # Extract code from response
+        # Extract LLM code
         try:
-            content = resp_json["choices"][0]["message"]["content"]
+            raw_content = resp_json["choices"][0]["message"]["content"]
         except Exception:
-            # older / different shape? try alternative keys
             try:
-                content = resp_json["choices"][0]["text"]
+                raw_content = resp_json["choices"][0]["text"]
             except Exception:
-                print("Unexpected AIPipe response shape:", resp_json)
+                print("ERROR: Unrecognized AIPipe response:", resp_json)
                 return
 
-        script_code = strip_markdown_code(content)
+        script_code = strip_markdown_code(raw_content)
         print("Generated script length:", len(script_code))
 
-        # Very small safety gate: ensure no heavy imports are present
-        banned = ["playwright", "selenium", "subprocess", "os.system", "pexpect"]
-        for b in banned:
-            if b in script_code:
-                print(f"Generated script contains banned token '{b}'. Aborting execution.")
-                return
+        # -------------------------------------------------------------
+        # FAILSAFE #1 — Auto-inject imports if missing
+        # -------------------------------------------------------------
+        required_imports = (
+            "import httpx\n"
+            "import asyncio\n"
+            "import base64\n"
+            "from bs4 import BeautifulSoup\n"
+            "import json\n"
+            "import re\n"
+        )
 
-        # Execute the generated script in-process
+        if not script_code.lstrip().startswith("import httpx"):
+            print("Auto-injecting required imports...")
+            script_code = required_imports + "\n" + script_code
+
+        # -------------------------------------------------------------
+        # FAILSAFE #2 — Strip forbidden patterns
+        # -------------------------------------------------------------
+        forbidden_patterns = [
+            "asyncio.run(",
+            "if __name__ == '__main__'",
+            "if __name__ == \"__main__\"",
+        ]
+
+        for pat in forbidden_patterns:
+            if pat in script_code:
+                print("Sanitizer: removing forbidden pattern:", pat)
+                script_code = script_code.replace(pat, f"# REMOVED_BY_SANITIZER {pat}")
+
+        # -------------------------------------------------------------
+        # FAILSAFE #3 — Prevent "main()" from being called inline
+        # -------------------------------------------------------------
+        # Remove patterns like: main()
+        # But keep "async def main():"
+        script_code = re.sub(
+            r"(?<!def )main\(\)",
+            "# REMOVED_BY_SANITIZER main()",
+            script_code
+        )
+
+        # -------------------------------------------------------------
+        # EXECUTE CLEAN SCRIPT
+        # -------------------------------------------------------------
         print("Executing generated script in-process (awaiting main()) ...")
         exec_result = await exec_generated_code(script_code, timeout=120.0)
+
         print("Execution result:", exec_result)
 
     except Exception:
         print("process_request unexpected error:\n", traceback.format_exc())
+
 
 
 # ----- API endpoints -----
