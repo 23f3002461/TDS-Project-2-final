@@ -141,9 +141,9 @@ You are an autonomous quiz-solving agent.
 You MUST output ONLY a valid Python script. 
 NO markdown. NO explanations. NO comments.
 
-CRITICAL RULES — READ CAREFULLY:
+CRITICAL RULES — FOLLOW EXACTLY:
 
-1. The script MUST start with EXACTLY these imports at the top:
+1. Your script MUST begin with EXACTLY these lines:
 
 import httpx
 import asyncio
@@ -152,37 +152,45 @@ from bs4 import BeautifulSoup
 import json
 import re
 
-2. If your script does NOT begin with these exact imports, 
-   the result is INVALID and must NOT be returned.
+If any import is missing or reordered, your answer is INVALID.
 
-3. Do NOT add or remove imports. Do NOT rearrange them.
-
-4. The script MUST define:
+2. You MUST define the function:
 
 async def main():
 
-5. Inside main(), you MUST:
-   - Fetch the quiz URL (async httpx)
-   - Detect <script> with base64 "atob(" encoded HTML
+3. main() MUST:
+   - Fetch the quiz page at: {start_url}
+   - Extract HTML containing base64-encoded strings inside <script> tags
+   - Detect patterns like atob("....")
    - Decode using base64.b64decode
-   - Extract quiz question text
-   - Compute the answer
-   - Extract submit URL using regex
-   - POST:
-     {
-       "email": "<EMAIL>",
-       "secret": "<SECRET>",
+   - Parse decoded HTML using BeautifulSoup
+   - Extract the quiz question text
+   - Compute the answer (e.g., numeric, string, JSON)
+   - Extract submit URL from decoded HTML using regex
+   - POST the answer using:
+
+     {{
+       "email": "{email}",
+       "secret": "{secret}",
        "url": "<CURRENT_URL>",
-       "answer": <answer>
-     }
-   - If response has "url", recursively continue
-   - Return final response object
+       "answer": ANSWER_VALUE
+     }}
 
-6. NO playwright. NO selenium. NO subprocess. NO external libraries.
+   - Read the JSON response
+   - If the response contains a "url", recursively fetch the next quiz and continue
+   - Stop when no new "url" is present
+   - Return the FINAL submission result (a Python value)
 
-7. The script MUST run using only standard library + httpx + bs4.
+4. DO NOT use:
+   - playwright
+   - selenium
+   - subprocess
+   - any LLM calls
+   - any external libraries except httpx + bs4 + stdlib
 
-8. NEVER call any LLM inside the generated script.
+5. The script MUST be concise and strictly valid Python.
+
+Begin your script immediately below.
 """
 
         # call AIPipe
